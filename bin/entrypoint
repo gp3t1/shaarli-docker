@@ -1,4 +1,5 @@
 #!/bin/sh
+
 if [ "$(id -u)" != '0' ]; then
 	printf "\nentrypoint must be  run as root!"
 	exit 1
@@ -11,7 +12,6 @@ PHP_CFGDIR="/etc/php7"
 PHP_CFGFILE="php.ini"
 PHPFPM_CFGFILE="php-fpm.conf"
 PHPFPMPOOL_CFGFILE="shaarli.conf" #php-fpm.d
-# TODO: SHAARLI_CFG="config.json.php"
 SUPERVISOR_CFGDIR="/etc/supervisor"
 SUPERVISOR_CFGFILE="supervisord.conf"
 SUPERVISED_CFGFILE="supervised-shaarli.conf"
@@ -24,111 +24,127 @@ processJ2Template() {
 	fi
 	TEMPLATE="$1"
 	TARGET="$2"
+
 	# Create folder if needed
 	if [ ! -d "$TARGET" ]; then	mkdir -p "$TARGET";	fi
+	
 	# Backup existing config
 	if [ -f "$TARGET/$TEMPLATE" ]; then	mv "$TARGET/$TEMPLATE" "$TARGET/$TEMPLATE.$(date +%Y%m%d.%H%M%S)";	fi
-  printf "\nEvaluating template\n\tSource: %s\n\tDest: %s" "${TEMPL_DIR}/${TEMPLATE}.j2" "${TARGET}/${TEMPLATE}"
+	printf "\n  %s\n  >> %s" "${TEMPL_DIR}/${TEMPLATE}.j2" "${TARGET}/${TEMPLATE}"
+  # printf "\nEvaluating template\n\tSource: %s\n\tDest: %s" "${TEMPL_DIR}/${TEMPLATE}.j2" "${TARGET}/${TEMPLATE}"
   j2 "${TEMPL_DIR}/${TEMPLATE}.j2" > "${TARGET}/${TEMPLATE}"
 }
 
 config(){
 	printf "\n[CONFIGURATION] Configure PHP,NGINX and SHAARLI with templates ..."
+	find "${PHP_CFGDIR}/php-fpm.d/" -name "*.conf" -exec mv {} {}.disabled \;
 	processJ2Template "${NGINX_CFGFILE}" 			"${NGINX_CFGDIR}"							|| exit 3
 	processJ2Template "${PHP_CFGFILE}" 				"${PHP_CFGDIR}"								|| exit 3
 	processJ2Template "${PHPFPM_CFGFILE}" 		"${PHP_CFGDIR}"								|| exit 3
 	processJ2Template "${PHPFPMPOOL_CFGFILE}" "${PHP_CFGDIR}/php-fpm.d"			|| exit 3
 	processJ2Template "${SUPERVISOR_CFGFILE}" "${SUPERVISOR_CFGDIR}"				|| exit 3
 	processJ2Template "${SUPERVISED_CFGFILE}" "${SUPERVISOR_CFGDIR}/conf.d"	|| exit 3
-	printf "\n[CONFIGURATION] PHP,NGINX and SHAARLI configured -----------------"
+	printf "\n[CONFIGURATION] PHP & NGINX configured"
 }
 
 setPerm(){
 	NGINX_PIDDIR="$(dirname "${NGINX_PIDFILE}")"
-	printf "\n[PERMISSIONS] set permissions on shaarli, php and nginx files  ..."
+	SUPERVISOR_PIDDIR="$(dirname "${SUPERVISORD_PIDFILE}")"
+
+	printf "\n[PERMISSIONS] Set permissions ..."
 	chown -R "$APP_USER:$APP_GROUP" "${SHAARLI_DIR}" \
-	&& chmod -R 760 "${SHAARLI_DIR}" 	|| exit 4
-	mkdir -p "${LOGS_DIR}" "${LOGS_DIR}/nginx" "${LOGS_DIR}/php" "${NGINX_PIDDIR}" "${SHAARLI_CACHEDIR}" \
-	&& chown -R "$APP_USER:$APP_GROUP" "${LOGS_DIR}/nginx" "${LOGS_DIR}/php" "${NGINX_PIDDIR}" "${SHAARLI_CACHEDIR}" \
-	&& chmod -R 760 "${LOGS_DIR}/nginx" "${LOGS_DIR}/php" "${NGINX_PIDDIR}" "${SHAARLI_CACHEDIR}"	|| exit 4
-	printf "\n[PERMISSIONS] permissions set ------------------------------------"
+	&& chmod -R 760 								"${SHAARLI_DIR}" || exit 4
+	
+	mkdir -p  													"${LOGS_DIR}/nginx" "${LOGS_DIR}/php" "${NGINX_PIDDIR}" "${SUPERVISOR_PIDDIR}" "${SHAARLI_CACHEDIR}" \
+	&& chown -R "$APP_USER:$APP_GROUP" 	"${LOGS_DIR}/nginx" "${LOGS_DIR}/php" "${NGINX_PIDDIR}" "${SUPERVISOR_PIDDIR}" "${SHAARLI_CACHEDIR}" \
+	&& chmod -R 760 										"${LOGS_DIR}/nginx" "${LOGS_DIR}/php" "${NGINX_PIDDIR}" "${SUPERVISOR_PIDDIR}" "${SHAARLI_CACHEDIR}" || exit 4
+	printf "\n[PERMISSIONS] permissions set"
 }
 
 initShaarliConfig(){
 	if [ ! -f "${SHAARLI_CFGFILE}" ]; then
 		# GENERATE CONFIG WHEN POSTING FIRST SETTINGS ON SETUP PAGE
-		if LOGIN="$(readSecret shaarli_user)" && $? -eq 0 && [ -n "$LOGIN" ]; then
-			if PASSW="$(readSecret shaarli_password)" && $? -eq 0 && [ -n "$PASSW" ]; then
-				if ! curl -iL -XPOST "http://localhost:${NGINX_PORT}/index.php" -d "setlogin=$LOGIN&setpassword=$PASSW&continent=${SHAARLI_CONTINENT}&city=${SHAARLI_CITY}&title=${SHAARLI_TITLE}&Save=Save+config" || [ ! -f "${SHAARLI_CFGFILE}" ]; then
-					printf "\nUnable to init Shaarli configuration"
-					exit 1
-				fi
+		printf "\n[CREDENTIALS] Looking for shaarli_user & shaarli_password (as secrets then as ENV variables) ..."
+		LOGIN="$(readSecret shaarli_user)"
+		PASSW="$(readSecret shaarli_password)"
+
+		if  [ -n "$LOGIN" ] && [ -n "$PASSW" ]; then
+			printf "\n[CREDENTIALS] values found for shaarli_user AND shaarli_password"
+			printf "\n[INIT RUN] Start nginx & php-fpm for preconfig (user&password are loaded from secrets or ENV variables) ..."
+			supervisord -c "${SUPERVISOR_CFGDIR}/${SUPERVISOR_CFGFILE}" && sleep 5
+			curl -sL -XPOST "http://localhost:${NGINX_PORT}/index.php" -d "setlogin=$LOGIN&setpassword=$PASSW&continent=${SHAARLI_CONTINENT}&city=${SHAARLI_CITY}&title=${SHAARLI_TITLE}&Save=Save+config" && sleep 2
+			if [ ! -f "${SHAARLI_CFGFILE}" ]; then
+				printf "\n[INIT RUN] Unable to init Shaarli configuration"
+				exit 1
 			fi
+			printf "\n[INIT RUN] Shaarli configuration initialised. Shutting down nginx & php-fpm"
+			kill -s SIGTERM "$(cat "${SUPERVISORD_PIDFILE}")"
+		else
+			printf "\n[CREDENTIALS] Unable to find values for shaarli_user AND shaarli_password"
+			exit 1
 		fi
-		# SET TIMEZONE
-		sed -ri "s|GLOBALS\['timezone'\]\s*=\s*'[^']*';$|GLOBALS['timezone'] = '${SHAARLI_CONTINENT}/${SHAARLI_CITY}';|" "${SHAARLI_CFGFILE}"
-		sed -ri "s|^date_default_timezone_set\('[^']*'\);$|date_default_timezone_set('${SHAARLI_CONTINENT}/${SHAARLI_CITY}');|" "${SHAARLI_CFGFILE}"
-		# SET title
-		sed -ri "s|GLOBALS\['title'\]\s*=\s*'[^']*';$|GLOBALS['title'] = '${SHAARLI_TITLE}';|" "${SHAARLI_CFGFILE}"
-		# SET titleLink
-		sed -ri "s|GLOBALS\['titleLink'\]\s*=\s*'[^']*';$|GLOBALS['titleLink'] = '${SHAARLI_TITLELINK}';|" "${SHAARLI_CFGFILE}"
-		# SET redirector
-		sed -ri "s|GLOBALS\['redirector'\]\s*=\s*'[^']*';$|GLOBALS['redirector'] = '${SHAARLI_REDIRECTOR}';|" "${SHAARLI_CFGFILE}"
-		# SET disablesessionprotection
-		sed -ri "s|GLOBALS\['disablesessionprotection'\]\s*=\s*'[^']*';$|GLOBALS['disablesessionprotection'] = '${SHAARLI_DISABLESESSIONPROTECT}';|" "${SHAARLI_CFGFILE}"
-		# SET privateLinkByDefault
-		sed -ri "s|GLOBALS\['privateLinkByDefault'\]\s*=\s*'[^']*';$|GLOBALS['privateLinkByDefault'] = '${SHAARLI_DEFAULTPRIVATELINK}';|" "${SHAARLI_CFGFILE}"
-		# SET DATADIR
-		sed -ri "s|GLOBALS\['config'\]\['DATADIR'\]\s*=\s*'[^']*';|GLOBALS['config']['DATADIR'] = '${SHAARLI_DATADIR}';|" "${SHAARLI_CFGFILE}"
-		# SET CONFIG_FILE
-		# SET DATASTORE
-		# SET IPBANS_FILENAME
-		# SET UPDATES_FILE
-		# SET LOG_FILE
-		sed -ri "s|GLOBALS\['config'\]\['LOG_FILE'\]\s*=\s*'[^']*';|GLOBALS['config']['LOG_FILE'] = '${SHAARLI_LOGFILE}';|" "${SHAARLI_CFGFILE}"
-		# SET UPDATECHECK_FILENAME
-		# SET ENABLE_UPDATECHECK
-		sed -ri "s|GLOBALS\['config'\]\['ENABLE_UPDATECHECK'\]\s*=\s*'[^']*';|GLOBALS['config']['ENABLE_UPDATECHECK'] = '${SHAARLI_CHECKUPDATE}';|" "${SHAARLI_CFGFILE}"
-		# SET RAINTPL_TMP
-		# SET RAINTPL_TPL
-		# SET CACHEDIR
-		sed -ri "s|GLOBALS\['config'\]\['CACHEDIR'\]\s*=\s*'[^']*';|GLOBALS['config']['CACHEDIR'] = '${SHAARLI_CACHEDIR}';|" "${SHAARLI_CFGFILE}"
-		# SET PAGECACHE
-		sed -ri "s|GLOBALS\['config'\]\['PAGECACHE'\]\s*=\s*'[^']*';|GLOBALS['config']['PAGECACHE'] = '${SHAARLI_PAGECACHE}';|" "${SHAARLI_CFGFILE}"
-		# SET BAN_AFTER
-		sed -ri "s|GLOBALS\['config'\]\['BAN_AFTER'\]\s*=\s*'[^']*';|GLOBALS['config']['BAN_AFTER'] = '${SHAARLI_BANAFTER}';|" "${SHAARLI_CFGFILE}"
-		# SET BAN_DURATION
-		sed -ri "s|GLOBALS\['config'\]\['BAN_DURATION'\]\s*=\s*'[^']*';|GLOBALS['config']['BAN_DURATION'] = '${SHAARLI_BANDURATION}';|" "${SHAARLI_CFGFILE}"
-		# SET ENABLE_RSS_PERMALINKS
-		sed -ri "s|GLOBALS\['config'\]\['ENABLE_RSS_PERMALINKS'\]\s*=\s*'[^']*';|GLOBALS['config']['ENABLE_RSS_PERMALINKS'] = '${SHAARLI_PERMALINKS}';|" "${SHAARLI_CFGFILE}"
-		# SET SHOW_ATOM
-		sed -ri "s|GLOBALS\['config'\]\['SHOW_ATOM'\]\s*=\s*'[^']*';|GLOBALS['config']['SHOW_ATOM'] = '${SHAARLI_SHOWATOM}';|" "${SHAARLI_CFGFILE}"
-		# SET HIDE_PUBLIC_LINKS
-		sed -ri "s|GLOBALS\['config'\]\['HIDE_PUBLIC_LINKS'\]\s*=\s*'[^']*';|GLOBALS['config']['HIDE_PUBLIC_LINKS'] = '${SHAARLI_HIDEPUBLICLINKS}';|" "${SHAARLI_CFGFILE}"
-		# SET HIDE_TIMESTAMPS
-		sed -ri "s|GLOBALS\['config'\]\['HIDE_TIMESTAMPS'\]\s*=\s*'[^']*';|GLOBALS['config']['HIDE_TIMESTAMPS'] = '${SHAARLI_HIDETIMESTAMPS}';|" "${SHAARLI_CFGFILE}"
-		# SET LINKS_PER_PAGE
-		sed -ri "s|GLOBALS\['config'\]\['LINKS_PER_PAGE'\]\s*=\s*'[^']*';|GLOBALS['config']['LINKS_PER_PAGE'] = '${SHAARLI_LINKSPERPAGE}';|" "${SHAARLI_CFGFILE}"
-		# SET OPEN_SHAARLI
-		sed -ri "s|GLOBALS\['config'\]\['OPEN_SHAARLI'\]\s*=\s*'[^']*';|GLOBALS['config']['OPEN_SHAARLI'] = '${SHAARLI_OPENSHAARLI}';|" "${SHAARLI_CFGFILE}"
-		# SET ENABLE_THUMBNAILS
-		sed -ri "s|GLOBALS\['config'\]\['ENABLE_THUMBNAILS'\]\s*=\s*'[^']*';|GLOBALS['config']['ENABLE_THUMBNAILS'] = '${SHAARLI_ENABLETHUMBNAILS}';|" "${SHAARLI_CFGFILE}"
-		# SET ENABLE_LOCALCACHE
-		sed -ri "s|GLOBALS\['config'\]\['ENABLE_LOCALCACHE'\]\s*=\s*'[^']*';|GLOBALS['config']['ENABLE_LOCALCACHE'] = '${SHAARLI_ENABLELOCALCACHE}';|" "${SHAARLI_CFGFILE}"
-		# SET UPDATECHECK_BRANCH
-		sed -ri "s|GLOBALS\['config'\]\['UPDATECHECK_BRANCH'\]\s*=\s*'[^']*';|GLOBALS['config']['UPDATECHECK_BRANCH'] = '${SHAARLI_UPDATECHECKBRANCH}';|" "${SHAARLI_CFGFILE}"
-		# SET UPDATECHECK_INTERVAL
-		sed -ri "s|GLOBALS\['config'\]\['UPDATECHECK_INTERVAL'\]\s*=\s*'[^']*';|GLOBALS['config']['UPDATECHECK_INTERVAL'] = '${SHAARLI_UPDATECHECKINTERVAL}';|" "${SHAARLI_CFGFILE}"
-		# SET REDIRECTOR_URLENCODE
-		sed -ri "s|GLOBALS\['config'\]\['REDIRECTOR_URLENCODE'\]\s*=\s*'[^']*';|GLOBALS['config']['REDIRECTOR_URLENCODE'] = '${SHAARLI_REDIRECTORURLENCODE}';|" "${SHAARLI_CFGFILE}"
-		# SET ENABLED_PLUGINS
-		sed -ri "s|GLOBALS\['config'\]\['ENABLED_PLUGINS'\]\s*=\s*'[^']*';|GLOBALS['config']['ENABLED_PLUGINS'] = '${SHAARLI_ENABLEDPLUGINS}';|" "${SHAARLI_CFGFILE}"
-		# SET PUBSUBHUB_URL
-		sed -ri "s|GLOBALS\['config'\]\['PUBSUBHUB_URL'\]\s*=\s*'[^']*';|GLOBALS['config']['PUBSUBHUB_URL'] = '${SHAARLI_PUBSUBHUBURL}';|" "${SHAARLI_CFGFILE}"
 	fi
+
+	printf "\n[SHAARLI CONFIG] Set Shaarli configuration from ENV variables ..."
+	# SET TIMEZONE
+	sed -ri "s|GLOBALS\['timezone'\]\s*=\s*'[^']*';$|GLOBALS['timezone'] = '${SHAARLI_CONTINENT}/${SHAARLI_CITY}';|" "${SHAARLI_CFGFILE}"
+	sed -ri "s|^date_default_timezone_set\('[^']*'\);$|date_default_timezone_set('${SHAARLI_CONTINENT}/${SHAARLI_CITY}');|" "${SHAARLI_CFGFILE}"
+	# SET title
+	sed -ri "s|GLOBALS\['title'\]\s*=\s*'[^']*';$|GLOBALS['title'] = '${SHAARLI_TITLE}';|" "${SHAARLI_CFGFILE}"
+	# SET titleLink
+	sed -ri "s|GLOBALS\['titleLink'\]\s*=\s*'[^']*';$|GLOBALS['titleLink'] = '${SHAARLI_TITLELINK}';|" "${SHAARLI_CFGFILE}"
+	# SET redirector
+	sed -ri "s|GLOBALS\['redirector'\]\s*=\s*'[^']*';$|GLOBALS['redirector'] = '${SHAARLI_REDIRECTOR}';|" "${SHAARLI_CFGFILE}"
+	# SET disablesessionprotection
+	sed -ri "s|GLOBALS\['disablesessionprotection'\]\s*=\s*'[^']*';$|GLOBALS['disablesessionprotection'] = '${SHAARLI_DISABLESESSIONPROTECT}';|" "${SHAARLI_CFGFILE}"
+	# SET privateLinkByDefault
+	sed -ri "s|GLOBALS\['privateLinkByDefault'\]\s*=\s*'[^']*';$|GLOBALS['privateLinkByDefault'] = '${SHAARLI_DEFAULTPRIVATELINK}';|" "${SHAARLI_CFGFILE}"
+	# SET DATADIR
+	sed -ri "s|GLOBALS\['config'\]\['DATADIR'\]\s*=\s*'[^']*';|GLOBALS['config']['DATADIR'] = '${SHAARLI_DATADIR}';|" "${SHAARLI_CFGFILE}"
+	# SET LOG_FILE
+	sed -ri "s|GLOBALS\['config'\]\['LOG_FILE'\]\s*=\s*'[^']*';|GLOBALS['config']['LOG_FILE'] = '${SHAARLI_LOGFILE}';|" "${SHAARLI_CFGFILE}"
+	# SET ENABLE_UPDATECHECK
+	sed -ri "s|GLOBALS\['config'\]\['ENABLE_UPDATECHECK'\]\s*=\s*'[^']*';|GLOBALS['config']['ENABLE_UPDATECHECK'] = '${SHAARLI_CHECKUPDATE}';|" "${SHAARLI_CFGFILE}"
+	# SET CACHEDIR
+	sed -ri "s|GLOBALS\['config'\]\['CACHEDIR'\]\s*=\s*'[^']*';|GLOBALS['config']['CACHEDIR'] = '${SHAARLI_CACHEDIR}';|" "${SHAARLI_CFGFILE}"
+	# SET PAGECACHE
+	sed -ri "s|GLOBALS\['config'\]\['PAGECACHE'\]\s*=\s*'[^']*';|GLOBALS['config']['PAGECACHE'] = '${SHAARLI_PAGECACHE}';|" "${SHAARLI_CFGFILE}"
+	# SET BAN_AFTER
+	sed -ri "s|GLOBALS\['config'\]\['BAN_AFTER'\]\s*=\s*'[^']*';|GLOBALS['config']['BAN_AFTER'] = '${SHAARLI_BANAFTER}';|" "${SHAARLI_CFGFILE}"
+	# SET BAN_DURATION
+	sed -ri "s|GLOBALS\['config'\]\['BAN_DURATION'\]\s*=\s*'[^']*';|GLOBALS['config']['BAN_DURATION'] = '${SHAARLI_BANDURATION}';|" "${SHAARLI_CFGFILE}"
+	# SET ENABLE_RSS_PERMALINKS
+	sed -ri "s|GLOBALS\['config'\]\['ENABLE_RSS_PERMALINKS'\]\s*=\s*'[^']*';|GLOBALS['config']['ENABLE_RSS_PERMALINKS'] = '${SHAARLI_PERMALINKS}';|" "${SHAARLI_CFGFILE}"
+	# SET SHOW_ATOM
+	sed -ri "s|GLOBALS\['config'\]\['SHOW_ATOM'\]\s*=\s*'[^']*';|GLOBALS['config']['SHOW_ATOM'] = '${SHAARLI_SHOWATOM}';|" "${SHAARLI_CFGFILE}"
+	# SET HIDE_PUBLIC_LINKS
+	sed -ri "s|GLOBALS\['config'\]\['HIDE_PUBLIC_LINKS'\]\s*=\s*'[^']*';|GLOBALS['config']['HIDE_PUBLIC_LINKS'] = '${SHAARLI_HIDEPUBLICLINKS}';|" "${SHAARLI_CFGFILE}"
+	# SET HIDE_TIMESTAMPS
+	sed -ri "s|GLOBALS\['config'\]\['HIDE_TIMESTAMPS'\]\s*=\s*'[^']*';|GLOBALS['config']['HIDE_TIMESTAMPS'] = '${SHAARLI_HIDETIMESTAMPS}';|" "${SHAARLI_CFGFILE}"
+	# SET LINKS_PER_PAGE
+	sed -ri "s|GLOBALS\['config'\]\['LINKS_PER_PAGE'\]\s*=\s*'[^']*';|GLOBALS['config']['LINKS_PER_PAGE'] = '${SHAARLI_LINKSPERPAGE}';|" "${SHAARLI_CFGFILE}"
+	# SET OPEN_SHAARLI
+	sed -ri "s|GLOBALS\['config'\]\['OPEN_SHAARLI'\]\s*=\s*'[^']*';|GLOBALS['config']['OPEN_SHAARLI'] = '${SHAARLI_OPENSHAARLI}';|" "${SHAARLI_CFGFILE}"
+	# SET ENABLE_THUMBNAILS
+	sed -ri "s|GLOBALS\['config'\]\['ENABLE_THUMBNAILS'\]\s*=\s*'[^']*';|GLOBALS['config']['ENABLE_THUMBNAILS'] = '${SHAARLI_ENABLETHUMBNAILS}';|" "${SHAARLI_CFGFILE}"
+	# SET ENABLE_LOCALCACHE
+	sed -ri "s|GLOBALS\['config'\]\['ENABLE_LOCALCACHE'\]\s*=\s*'[^']*';|GLOBALS['config']['ENABLE_LOCALCACHE'] = '${SHAARLI_ENABLELOCALCACHE}';|" "${SHAARLI_CFGFILE}"
+	# SET UPDATECHECK_BRANCH
+	sed -ri "s|GLOBALS\['config'\]\['UPDATECHECK_BRANCH'\]\s*=\s*'[^']*';|GLOBALS['config']['UPDATECHECK_BRANCH'] = '${SHAARLI_UPDATECHECKBRANCH}';|" "${SHAARLI_CFGFILE}"
+	# SET UPDATECHECK_INTERVAL
+	sed -ri "s|GLOBALS\['config'\]\['UPDATECHECK_INTERVAL'\]\s*=\s*'[^']*';|GLOBALS['config']['UPDATECHECK_INTERVAL'] = '${SHAARLI_UPDATECHECKINTERVAL}';|" "${SHAARLI_CFGFILE}"
+	# SET REDIRECTOR_URLENCODE
+	sed -ri "s|GLOBALS\['config'\]\['REDIRECTOR_URLENCODE'\]\s*=\s*'[^']*';|GLOBALS['config']['REDIRECTOR_URLENCODE'] = '${SHAARLI_REDIRECTORURLENCODE}';|" "${SHAARLI_CFGFILE}"
+	# SET ENABLED_PLUGINS
+	sed -ri "s|GLOBALS\['config'\]\['ENABLED_PLUGINS'\]\s*=\s*'[^']*';|GLOBALS['config']['ENABLED_PLUGINS'] = '${SHAARLI_ENABLEDPLUGINS}';|" "${SHAARLI_CFGFILE}"
+	# SET PUBSUBHUB_URL
+	sed -ri "s|GLOBALS\['config'\]\['PUBSUBHUB_URL'\]\s*=\s*'[^']*';|GLOBALS['config']['PUBSUBHUB_URL'] = '${SHAARLI_PUBSUBHUBURL}';|" "${SHAARLI_CFGFILE}"
+	# TODO: SET CONFIG_FILE, DATASTORE, IPBANS_FILENAME, UPDATES_FILE, UPDATECHECK_FILENAME, RAINTPL_TMP, RAINTPL_TPL
+	printf "\n[SHAARLI CONFIG] Shaarli configured in %s" "${SHAARLI_CFGFILE}"
 }
 
 if config && setPerm && initShaarliConfig; then
+	printf "\n\n"
 	set -x
 	tini "$@"
 fi

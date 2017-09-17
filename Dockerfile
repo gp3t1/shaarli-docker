@@ -1,4 +1,4 @@
-FROM gp3t1/alpine:0.7
+FROM gp3t1/alpine:0.7.1
 
 # SHAARLI BUILD SETTINGS
 ARG VERSION="stable"
@@ -14,7 +14,8 @@ RUN setAppUser
 ## GLOBAL CONFIG
 ENV LOGS_DIR="/data/logs" \
 		SUPERVISORD_SOCK="/var/run/supervisord.sock" \
-		SUPERVISORD_LOGLVL="info"
+		SUPERVISORD_LOGLVL="info" \
+		SUPERVISORD_PIDFILE="/run/supervisord.pid"
 ## SHAARLI CONFIG
 ENV SHAARLI_DIR="/var/www/shaarli" \
 		SHAARLI_SOCK="/var/run/php7-fpm-shaarli.sock" \
